@@ -2,7 +2,7 @@ package solutions;
 
 public class Solution {
 
-    /** Returns the middle node of a singly-linked list. */
+    /** Returns the middle node of a singly-linked list. *///s
     public ListNode middleNode(ListNode head) {
         ListNode slow = head, fast = head;
         while (fast != null && fast.next != null) {
