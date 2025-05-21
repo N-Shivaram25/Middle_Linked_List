@@ -1,0 +1,595 @@
+name: Solution Testing Workflow
+
+on:
+  push:
+    paths:
+      - 'solutions/**'
+  pull_request:
+    paths:
+      - 'solutions/**'
+  # Add manual trigger option
+  workflow_dispatch:
+    inputs:
+      file_to_test:
+        description: 'Solution file to test (e.g. solutions/solution.cpp)'
+        required: true
+        default: 'solutions/solution.cpp'
+
+jobs:
+  check-single-file-change:
+    runs-on: ubuntu-latest
+    outputs:
+      changed_file: ${{ steps.check-files.outputs.changed_file }}
+      language: ${{ steps.detect-language.outputs.language }}
+      file_basename: ${{ steps.parse-filename.outputs.basename }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set file from manual input
+        id: set-manual-file
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "changed_file=${{ github.event.inputs.file_to_test }}" >> $GITHUB_OUTPUT
+          echo "Using manually specified file: ${{ github.event.inputs.file_to_test }}"
+
+      - name: Check for single file change
+        id: check-files
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            CHANGED_FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.event.after }} | grep -E "^solutions/")
+          else
+            CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} | grep -E "^solutions/")
+          fi
+          
+          echo "Changed solution files:"
+          echo "$CHANGED_FILES"
+          
+          # Count how many solution files were changed
+          CHANGED_COUNT=$(echo "$CHANGED_FILES" | grep -v "^$" | wc -l)
+          
+          if [ "$CHANGED_COUNT" -gt 1 ]; then
+            echo "::error::Multiple solution files were changed in this commit. Please modify only one solution file at a time."
+            exit 1
+          elif [ "$CHANGED_COUNT" -eq 0 ]; then
+            echo "No solution files were changed."
+            exit 0
+          else
+            echo "changed_file=$CHANGED_FILES" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine file to use
+        id: determine-file
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            FINAL_FILE="${{ steps.set-manual-file.outputs.changed_file }}"
+          else
+            FINAL_FILE="${{ steps.check-files.outputs.changed_file }}"
+          fi
+          echo "final_file=$FINAL_FILE" >> $GITHUB_OUTPUT
+          echo "Using file: $FINAL_FILE"
+
+      - name: Detect programming language
+        id: detect-language
+        if: steps.determine-file.outputs.final_file != ''
+        run: |
+          FILE="${{ steps.determine-file.outputs.final_file }}"
+          if [[ "$FILE" == *.py ]]; then
+            echo "language=python" >> $GITHUB_OUTPUT
+          elif [[ "$FILE" == *.c ]]; then
+            echo "language=c" >> $GITHUB_OUTPUT
+          elif [[ "$FILE" == *.cpp ]]; then
+            echo "language=cpp" >> $GITHUB_OUTPUT
+          elif [[ "$FILE" == *.java ]]; then
+            echo "language=java" >> $GITHUB_OUTPUT
+          else
+            echo "::error::Unsupported file type: $FILE"
+            exit 1
+          fi
+      
+      - name: Parse filename
+        id: parse-filename
+        if: steps.determine-file.outputs.final_file != ''
+        run: |
+          FILE="${{ steps.determine-file.outputs.final_file }}"
+          BASENAME=$(basename "$FILE" | cut -d. -f1)
+          echo "basename=$BASENAME" >> $GITHUB_OUTPUT
+
+  run-tests:
+    needs: check-single-file-change
+    if: needs.check-single-file-change.outputs.changed_file != '' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Debug step to show environment (can remove this once everything works)
+      - name: Debug workflow environment
+        run: |
+          echo "Event name: ${{ github.event_name }}"
+          echo "Changed file: ${{ needs.check-single-file-change.outputs.changed_file }}"
+          echo "Language: ${{ needs.check-single-file-change.outputs.language }}"
+          ls -la
+          ls -la solutions/
+          ls -la tests/
+
+      - name: Check solution for empty or incomplete code
+        run: |
+          # Use workflow_dispatch input or change detection
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            FILE="${{ github.event.inputs.file_to_test }}"
+          else
+            FILE="${{ needs.check-single-file-change.outputs.changed_file }}"
+          fi
+          
+          echo "Checking file: $FILE"
+          
+          # Check if file is empty
+          if [ ! -s "$FILE" ]; then
+            echo "::error::Solution file is empty."
+            exit 1
+          fi
+          
+          # Language-specific checks
+          if [[ "$FILE" == *.py ]]; then
+            # Python checks
+            if grep -q "^[[:space:]]*pass[[:space:]]*$" "$FILE" || grep -q "^[[:space:]]*# TODO" "$FILE"; then
+              echo "::error::Python solution appears to be incomplete (contains placeholder code)."
+              exit 1
+            fi
+            
+            # Check if the required function exists and has implementation
+            if grep -q "def middleNode" "$FILE"; then
+              # Check if function has a body with proper indentation
+              FUNCTION_LINE=$(grep -n "def middleNode" "$FILE" | cut -d: -f1)
+              NEXT_LINE=$((FUNCTION_LINE + 1))
+              NEXT_LINE_CONTENT=$(sed -n "${NEXT_LINE}p" "$FILE")
+              if ! echo "$NEXT_LINE_CONTENT" | grep -q "^[[:space:]]\+"; then
+                echo "::error::Python middleNode function is incomplete (no implementation)."
+                exit 1
+              fi
+              
+              # Check if the next line is just a comment
+              if echo "$NEXT_LINE_CONTENT" | grep -q "^[[:space:]]\+#"; then
+                echo "::error::Python middleNode function only has comments, no implementation."
+                exit 1
+              fi
+            else
+              echo "::error::Python solution is missing the required middleNode function."
+              exit 1
+            fi
+            
+            # Check file size
+            if [ $(wc -c <"$FILE") -lt 30 ]; then
+              echo "::error::Python solution appears to be too small to be complete."
+              exit 1
+            fi
+            
+            # Syntax check
+            python -m py_compile "$FILE" 2>/tmp/python_syntax.log || {
+              echo "::error::Python solution has syntax errors:"
+              cat /tmp/python_syntax.log
+              exit 1
+            }
+            
+          elif [[ "$FILE" == *.c ]]; then
+            # C checks
+            if grep -q "// TODO" "$FILE"; then
+              echo "::error::C solution appears to be incomplete (contains TODO comments)."
+              exit 1
+            fi
+            
+            # Check for middleNode function
+            if ! grep -q "struct ListNode\* middleNode" "$FILE"; then
+              echo "::error::C solution is missing the required middleNode function."
+              exit 1
+            fi
+            
+            # Check for implementation
+            if ! grep -q "struct ListNode\* middleNode[[:space:]]*([^)]*)[[:space:]]*{" "$FILE"; then
+              echo "::error::C solution appears to be incomplete (no middleNode function implementation found)."
+              exit 1
+            fi
+            
+            # Check for simple return statements that might indicate incomplete implementation
+            if grep -qE "middleNode[[:space:]]*\([^)]*\)[[:space:]]*{[[:space:]]*return[[:space:]]+head[[:space:]]*;[[:space:]]*}" "$FILE" || grep -qE "middleNode[[:space:]]*\([^)]*\)[[:space:]]*{[[:space:]]*return[[:space:]]+NULL[[:space:]]*;[[:space:]]*}" "$FILE"; then
+              echo "::error::C solution appears to be incomplete (function body only contains simple return statement)."
+              exit 1
+            fi
+            
+            # Check file size
+            if [ $(wc -c <"$FILE") -lt 50 ]; then
+              echo "::error::C solution appears to be too small to be complete."
+              exit 1
+            fi
+            
+          elif [[ "$FILE" == *.cpp ]]; then
+            # C++ checks
+            if grep -q "// TODO" "$FILE"; then
+              echo "::error::C++ solution appears to be incomplete (contains TODO comments)."
+              exit 1
+            fi
+            
+            # Check for necessary includes
+            if ! grep -q "#include <vector>" "$FILE" && grep -q "std::vector" "$FILE"; then
+              echo "::error::Solution is using std::vector but missing #include <vector>"
+              exit 1
+            fi
+            
+            # Check for function implementation by looking for { } blocks
+            if ! grep -qE "[{][^}]*[}]" "$FILE"; then
+              echo "::error::C++ solution appears to be incomplete (no function bodies found)."
+              exit 1
+            fi
+            
+            # Check file size
+            if [ $(wc -c <"$FILE") -lt 50 ]; then
+              echo "::error::C++ solution appears to be too small to be complete."
+              exit 1
+            fi
+            
+          elif [[ "$FILE" == *.java ]]; then
+            # Java checks
+            if grep -q "// TODO" "$FILE" || grep -q "throw new UnsupportedOperationException" "$FILE"; then
+              echo "::error::Java solution appears to be incomplete (contains placeholder code)."
+              exit 1
+            fi
+            
+            # Check for method implementation
+            if ! grep -qE "[{][^}]*[}]" "$FILE"; then
+              echo "::error::Java solution appears to be incomplete (no method bodies found)."
+              exit 1
+            fi
+            
+            # Check file size
+            if [ $(wc -c <"$FILE") -lt 100 ]; then
+              echo "::error::Java solution appears to be too small to be complete."
+              exit 1
+            fi
+          fi
+          
+          echo "Solution check passed: The code appears to be complete."
+
+      # Setup for Python
+      - name: Set up Python
+        if: needs.check-single-file-change.outputs.language == 'python' || endsWith(github.event.inputs.file_to_test, '.py')
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          
+      - name: Install Python dependencies
+        if: needs.check-single-file-change.outputs.language == 'python' || endsWith(github.event.inputs.file_to_test, '.py')
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest numpy pandas
+          # Add more dependencies as needed for specific problems
+
+      # Setup for C/C++
+      - name: Set up C/C++ environment
+        if: needs.check-single-file-change.outputs.language == 'c' || needs.check-single-file-change.outputs.language == 'cpp' || endsWith(github.event.inputs.file_to_test, '.c') || endsWith(github.event.inputs.file_to_test, '.cpp')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      # Setup for Java
+      - name: Set up JDK
+        if: needs.check-single-file-change.outputs.language == 'java' || endsWith(github.event.inputs.file_to_test, '.java')
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # Determine language for manual runs
+      - name: Determine language for manual runs
+        id: manual-language
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          FILE="${{ github.event.inputs.file_to_test }}"
+          if [[ "$FILE" == *.py ]]; then
+            echo "manual_language=python" >> $GITHUB_OUTPUT
+          elif [[ "$FILE" == *.c ]]; then
+            echo "manual_language=c" >> $GITHUB_OUTPUT
+          elif [[ "$FILE" == *.cpp ]]; then
+            echo "manual_language=cpp" >> $GITHUB_OUTPUT
+          elif [[ "$FILE" == *.java ]]; then
+            echo "manual_language=java" >> $GITHUB_OUTPUT
+          else
+            echo "::error::Unsupported file type: $FILE"
+            exit 1
+          fi
+
+      # Test execution for Python
+      - name: Run Python tests
+        if: needs.check-single-file-change.outputs.language == 'python' || steps.manual-language.outputs.manual_language == 'python'
+        run: |
+          # Make sure the solutions directory is in Python path
+          export PYTHONPATH=$PYTHONPATH:$(pwd)
+          
+          # Run the tests with focused output
+          cd tests
+          python test.py
+        continue-on-error: false
+
+      # Test execution for C
+      - name: Run C tests
+        if: needs.check-single-file-change.outputs.language == 'c' || steps.manual-language.outputs.manual_language == 'c'
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            SOLUTION_FILE="${{ github.event.inputs.file_to_test }}"
+          else
+            SOLUTION_FILE="${{ needs.check-single-file-change.outputs.changed_file }}"
+          fi
+          echo "Running C tests for $SOLUTION_FILE"
+          
+          # Create a directory for testing artifacts
+          mkdir -p build
+          
+          # Compile just the solution file as object file (without main)
+          gcc -c "$SOLUTION_FILE" -o build/solution.o
+          
+          # Compile the test file with the solution object
+          gcc -o build/test_runner tests/test.c build/solution.o
+          
+          # Run the tests and capture output
+          cd build && ./test_runner
+          
+          # Check if any test failed and exit with error if so
+          if [ $? -ne 0 ]; then
+            echo "::error::Tests failed!"
+            exit 1
+          fi
+        continue-on-error: false
+
+      # Test execution for C++ - IMPROVED
+      - name: Run C++ tests
+        if: needs.check-single-file-change.outputs.language == 'cpp' || steps.manual-language.outputs.manual_language == 'cpp'
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            SOLUTION_FILE="${{ github.event.inputs.file_to_test }}"
+          else
+            SOLUTION_FILE="${{ needs.check-single-file-change.outputs.changed_file }}"
+          fi
+          echo "Running C++ tests for $SOLUTION_FILE"
+          
+          # Create a directory for testing artifacts
+          mkdir -p build
+          
+          # Create a combined test file that will work with the solution
+          echo '#include <iostream>
+          #include <vector>
+          #include <string>
+          #include <cassert>
+          
+          // First include the solution file directly
+          #include "../'$SOLUTION_FILE'"
+          
+          // Helper function to get the middle node using the naive way (for verification)
+          ListNode* getMiddleNodeReference(ListNode* head) {
+              // If the list is empty
+              if (head == nullptr) return nullptr;
+              
+              // Count the number of nodes
+              int count = 0;
+              ListNode* current = head;
+              while (current != nullptr) {
+                  count++;
+                  current = current->next;
+              }
+              
+              // Find the middle node (floor division for even lengths)
+              int middleIndex = count / 2;
+              current = head;
+              for (int i = 0; i < middleIndex; i++) {
+                  current = current->next;
+              }
+              
+              return current;
+          }
+          
+          // Function to run a test case
+          bool runTest(const std::vector<int>& arr, const char* testName) {
+              // Create list from array
+              ListNode* head = Solution::buildList(arr);
+              
+              // Get the expected result
+              ListNode* expected = getMiddleNodeReference(head);
+              
+              // Get the result from the solution
+              Solution solution;
+              ListNode* result = solution.middleNode(head);
+              
+              // Check if they match
+              bool passed = (result == expected);
+              
+              // Print test results with colored output
+              std::cout << "Test Case " << testName << ": ";
+              if (passed) {
+                  std::cout << "✅ PASSED" << std::endl;
+                  std::cout << "  Expected and actual middle nodes match at value: " << result->val << std::endl;
+              } else {
+                  std::cout << "❌ FAILED" << std::endl;
+                  std::cout << "  Expected middle at value: " << expected->val << ", got: " << result->val << std::endl;
+              }
+              
+              // Clean up
+              Solution::deleteList(head);
+              
+              return passed;
+          }
+          
+          int main() {
+              std::cout << "Running tests for middleNode function...\n\n";
+              
+              int testsPassed = 0;
+              int totalTests = 5;
+              
+              // Test Case 1: Odd number of nodes
+              std::vector<int> arr1 = {1, 2, 3, 4, 5};
+              if (runTest(arr1, "1 (Odd length list)")) testsPassed++;
+              
+              // Test Case 2: Even number of nodes
+              std::vector<int> arr2 = {1, 2, 3, 4, 5, 6};
+              if (runTest(arr2, "2 (Even length list)")) testsPassed++;
+              
+              // Test Case 3: Single node
+              std::vector<int> arr3 = {42};
+              if (runTest(arr3, "3 (Single node)")) testsPassed++;
+              
+              // Test Case 4: Two nodes
+              std::vector<int> arr4 = {10, 20};
+              if (runTest(arr4, "4 (Two nodes)")) testsPassed++;
+              
+              // Test Case 5: 10 nodes
+              std::vector<int> arr5 = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+              if (runTest(arr5, "5 (10 nodes)")) testsPassed++;
+              
+              // Summary
+              std::cout << "\nTest Summary: " << testsPassed << "/" << totalTests << " tests passed" << std::endl;
+              
+              // Return 0 if all tests pass, 1 otherwise
+              return (testsPassed == totalTests) ? 0 : 1;
+          }' > build/combined_test.cpp
+          
+          # Compile the combined test file
+          g++ -std=c++17 build/combined_test.cpp -o build/test_runner
+          
+          # Run the tests and capture output
+          cd build && ./test_runner
+          
+          # Check if any test failed and exit with error if so
+          if [ $? -ne 0 ]; then
+            echo "::error::Tests failed!"
+            exit 1
+          fi
+        continue-on-error: false
+
+      # Test execution for Java
+      - name: Run Java tests
+        if: needs.check-single-file-change.outputs.language == 'java' || steps.manual-language.outputs.manual_language == 'java'
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            SOLUTION_FILE="${{ github.event.inputs.file_to_test }}"
+          else
+            SOLUTION_FILE="${{ needs.check-single-file-change.outputs.changed_file }}"
+          fi
+          echo "Running Java tests for $SOLUTION_FILE"
+          
+          # Create build directory
+          mkdir -p build
+          
+          # Create an adapter test file that doesn't have duplicate class definitions
+          echo 'import java.util.Arrays;
+
+          public class TestAdapter {
+              public static void main(String[] args) {
+                  System.out.println("Running tests for middleNode function...\n");
+                  
+                  int testsPassed = 0;
+                  int totalTests = 5;
+                  
+                  // Test Case 1: Odd number of nodes
+                  int[] arr1 = {1, 2, 3, 4, 5};
+                  if (runTest(arr1, "1 (Odd length list)")) testsPassed++;
+                  
+                  // Test Case 2: Even number of nodes
+                  int[] arr2 = {1, 2, 3, 4, 5, 6};
+                  if (runTest(arr2, "2 (Even length list)")) testsPassed++;
+                  
+                  // Test Case 3: Single node
+                  int[] arr3 = {42};
+                  if (runTest(arr3, "3 (Single node)")) testsPassed++;
+                  
+                  // Test Case 4: Two nodes
+                  int[] arr4 = {10, 20};
+                  if (runTest(arr4, "4 (Two nodes)")) testsPassed++;
+                  
+                  // Test Case 5: 10 nodes
+                  int[] arr5 = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+                  if (runTest(arr5, "5 (10 nodes)")) testsPassed++;
+                  
+                  // Summary
+                  System.out.println("\nTest Summary: " + testsPassed + "/" + totalTests + " tests passed");
+                  
+                  // Exit with appropriate status
+                  System.exit(testsPassed == totalTests ? 0 : 1);
+              }
+              
+              // Helper function to get the reference middle node (for verification)
+              private static ListNode getMiddleNodeReference(ListNode head) {
+                  // If the list is empty
+                  if (head == null) return null;
+                  
+                  // Count the nodes
+                  int count = 0;
+                  ListNode curr = head;
+                  while (curr != null) {
+                      count++;
+                      curr = curr.next;
+                  }
+                  
+                  // Find the middle (count/2)
+                  int middle = count / 2;
+                  curr = head;
+                  for (int i = 0; i < middle; i++) {
+                      curr = curr.next;
+                  }
+                  
+                  return curr;
+              }
+              
+              // Run a test case
+              private static boolean runTest(int[] arr, String testName) {
+                  // Create list from array
+                  ListNode head = Solution.buildList(arr);
+                  
+                  // Get the expected result
+                  ListNode expected = getMiddleNodeReference(head);
+                  
+                  // Get the result from the solution
+                  Solution solution = new Solution();
+                  ListNode result = solution.middleNode(head);
+                  
+                  // Check if they match
+                  boolean passed = (result == expected);
+                  
+                  // Print test results with colored output
+                  System.out.print("Test Case " + testName + ": ");
+                  if (passed) {
+                      System.out.println("✅ PASSED");
+                      if (result != null) {
+                          System.out.println("  Expected and actual middle nodes match at value: " + result.val);
+                      } else {
+                          System.out.println("  Expected and actual middle nodes are both null");
+                      }
+                  } else {
+                      System.out.println("❌ FAILED");
+                      System.out.println("  Expected middle at value: " + (expected != null ? expected.val : "null") + 
+                                       ", got: " + (result != null ? result.val : "null"));
+                  }
+                  
+                  return passed;
+              }
+          }' > build/TestAdapter.java
+          
+          # Compile Java files - compile original files first
+          javac -d build "$SOLUTION_FILE"
+          
+          # Compile the test adapter
+          javac -cp build -d build build/TestAdapter.java
+          
+          # Run the tests and capture output
+          cd build && java TestAdapter
+          
+          # Check if any test failed and exit with error if so
+          if [ $? -ne 0 ]; then
+            echo "::error::Tests failed!"
+            exit 1
+          fi
+        continue-on-error: false
+
+      - name: Test Results Summary
+        run: |
+          echo "✅ All tests have passed successfully!"
