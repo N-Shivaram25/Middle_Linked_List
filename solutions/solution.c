@@ -6,7 +6,7 @@ struct ListNode {
     int val;
     struct ListNode *next;
 };
-
+//sdds
 // Function to find the middle node
 struct ListNode* middleNode(struct ListNode* head) {
     // Using the fast and slow pointer technique (Floyd's Tortoise and Hare)
