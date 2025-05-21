@@ -1,63 +1,35 @@
-// Definition for singly-linked lists.
-class ListNode {
-    int val;
-    ListNode next;
-    
-    ListNode() {}
-    
-    ListNode(int val) {
-        this.val = val;
-    }
-    
-    ListNode(int val, ListNode next) {
-        this.val = val;
-        this.next = next;
-    }
-}
+package solutions;
 
 public class Solution {
+
+    /** Returns the middle node of a singly-linked list. */
     public ListNode middleNode(ListNode head) {
-        // Using slow and fast pointer approach (Floyd's Tortoise and Hare)
-        // Fast pointer moves twice as fast as slow pointer
-        // When fast reaches the end, slow will be at the middle
-        ListNode slow = head;
-        ListNode fast = head;
-        
+        ListNode slow = head, fast = head;
         while (fast != null && fast.next != null) {
             slow = slow.next;
             fast = fast.next.next;
         }
-        
         return slow;
     }
-    
-    // Helper function to build a linked list from an array
+
+    /** Build a list from an int array and return the head. */
     public static ListNode buildList(int[] values) {
-        if (values == null || values.length == 0) {
-            return null;
-        }
-        
+        if (values == null || values.length == 0) return null;
+
         ListNode head = new ListNode(values[0]);
-        ListNode current = head;
-        
+        ListNode cur  = head;
         for (int i = 1; i < values.length; i++) {
-            current.next = new ListNode(values[i]);
-            current = current.next;
+            cur.next = new ListNode(values[i]);
+            cur      = cur.next;
         }
-        
         return head;
     }
-    
-    // Helper function to print a linked list
+
+    /** Print the list in “1 -> 2 -> 3” form. */
     public static void printList(ListNode head) {
-        ListNode current = head;
-        while (current != null) {
-            System.out.print(current.val);
-            if (current.next != null) {
-                System.out.print(" -> ");
-            }
-            current = current.next;
+        for (ListNode cur = head; cur != null; cur = cur.next) {
+            System.out.print(cur.val + (cur.next != null ? " -> " : ""));
         }
         System.out.println();
     }
-}///gjgssss
+}
